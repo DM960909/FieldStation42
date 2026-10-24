@@ -56,7 +56,7 @@ class ParentalControlsWindow(QWidget):
             | Qt.WindowStaysOnTopHint
             | Qt.Tool
             | Qt.WindowDoesNotAcceptFocus
-            | Qt.X11BypassWindowManagerHint
+            | (Qt.X11BypassWindowManagerHint if hasattr(Qt, "X11BypassWindowManagerHint") else Qt.WindowFlags())
         )
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)

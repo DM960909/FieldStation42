@@ -226,11 +226,41 @@ If no `fallback_tag` is specified and content is not found, the scheduler will g
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `messages` | array of strings | Text messages to display |
-| `images` | array of strings | Image paths to display |
-| `play_sound` | boolean | Whether to play background sound |
+| `messages` | array of strings | Heading text shown in the guide header (rotates if there are several) |
+| `play_sound` | boolean | Whether to play background sound while the guide is open |
 | `sound_to_play` | string or array | Path to audio file, directory path, or array of files for shuffle playlist |
-| `scroll_speed` | number | Speed of scrolling (e.g., `1.0`) |
+| `images` | array of strings | No longer drawn by the guide; files listed here are still checked at startup |
+| `scroll_speed` | number | No longer used; the guide scrolls with the remote's NAV pad |
+
+The remote's **GUIDE** button opens the configured `guide` station. For a TV-style
+full-screen guide, set `fullscreen` to `true` and `window_decorations` to `false`. The
+guide lists every non-hidden station in a glossy, early-2000s style grid with a
+now/next panel for the highlighted channel. Mark the guide station itself as `hidden`
+so it does not appear as a program row.
+
+**Using the guide from the remote:** switch the remote to its **NAV** pad, then use ▲/▼
+to move the highlight through the channels (it wraps, and scrolls when there are more
+channels than fit on screen) and **OK** to tune the highlighted channel full screen.
+The channel number buttons and CH ▲/▼ still change channel directly.
+
+**Preview box:** when the guide is opened from a channel, the top-right box keeps playing
+that program (muted, at the position you left it) and the cursor starts on that channel,
+so pressing **OK** straight away returns you to it. The preview is decoded with `ffmpeg`,
+which must be installed; without it the box shows "NO PREVIEW".
+
+```json
+{
+  "station_conf": {
+    "network_name": "Guide",
+    "channel_number": 0,
+    "network_type": "guide",
+    "hidden": true,
+    "fullscreen": true,
+    "window_decorations": false,
+    "scroll_speed": 0
+  }
+}
+```
 
 #### Guide Audio Examples
 

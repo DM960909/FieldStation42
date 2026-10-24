@@ -1,4 +1,5 @@
 from enum import Enum
+from queue import Empty
 import logging
 
 import multiprocessing
@@ -7,8 +8,11 @@ import datetime
 import json
 import os
 import glob
+import platform
 import random
+import shutil
 import logging
+import subprocess
 import time
 from python_mpv_jsonipc import MPV
 
@@ -213,6 +217,10 @@ class StationPlayer:
         self.schedule_lock = None
         self._active_afx = None
         self._pending_response = None
+        self._activate_mpv_after_guide = False
+        self._channel_banner_pending = True
+        self.previous_station_config = None
+        self._last_program = None
 
     def load_up(self):
         start_time = time.perf_counter()
@@ -222,6 +230,21 @@ class StationPlayer:
 
     def show_text(self, text, duration=4):
         self.mpv.command("show-text", text, duration)
+
+    def _show_channel_banner(self, title):
+        if not self.station_config:
+            return
+
+        channel_number = str(self.station_config["channel_number"]).zfill(3)
+        network_name = str(self.station_config["network_name"]).upper()
+        program_title = " ".join(str(title).split())[:72]
+        banner = f"CH {channel_number}  {network_name}\nNOW PLAYING  {program_title}"
+        self.mpv.command("show-text", banner, 5000)
+
+    def _show_pending_channel_banner(self, title):
+        if self._channel_banner_pending:
+            self._show_channel_banner(title)
+            self._channel_banner_pending = False
 
     def mpv_runtime_command(self, action):
         """Run a small set of user-facing mpv runtime commands."""
@@ -516,6 +539,43 @@ class StationPlayer:
     def update_filters(self):
         self.mpv.vf = self.reception.filter()
 
+    def _show_mpv_fullscreen(self):
+        self.mpv.window_minimized = False
+        self.mpv.fullscreen = True
+
+        if platform.system() != "Darwin":
+            return
+
+        osascript = shutil.which("osascript")
+        if not osascript:
+            self._l.warning("Cannot activate MPV on macOS: osascript is unavailable")
+            return
+
+        script = (
+            "tell application \"System Events\" to set frontmost of "
+            '(first process whose name is "mpv") to true'
+        )
+        activation_count = 2 if self._activate_mpv_after_guide else 1
+        self._activate_mpv_after_guide = False
+        for attempt in range(activation_count):
+            if attempt:
+                time.sleep(0.5)
+            try:
+                subprocess.run(
+                    [osascript, "-e", script],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except subprocess.CalledProcessError as error:
+                self._l.warning(
+                    "macOS could not activate MPV: %s",
+                    error.stderr.strip() if error.stderr else error,
+                )
+            except subprocess.TimeoutExpired:
+                self._l.warning("Timed out while activating MPV on macOS")
+
     def update_reception(self):
         if not self.reception.is_perfect():
             self.reception.improve()
@@ -593,6 +653,7 @@ class StationPlayer:
                 self._l.info(f"playing {file_path}")
                 self.mpv.command("playlist-clear")
                 self.mpv.play(file_path)
+                self._show_mpv_fullscreen()
                 
 
                 timeout_seconds = StationManager().server_conf.get("video_seek_timeout", 10)
@@ -822,17 +883,79 @@ class StationPlayer:
     def play_image(self, duration):
         pass
 
+    GUIDE_NAV_KEYS = {
+        "PageUp": GuideCommands.nav_up,
+        "PageDown": GuideCommands.nav_down,
+        "Enter": GuideCommands.nav_select,
+    }
+
+    def _guide_preview_context(self):
+        """Describes the program being watched so the guide can show it in its preview box."""
+        program = self._last_program
+        previous = self.previous_station_config
+        if not program or not previous or previous.get("network_type") == "guide":
+            return None
+        if program["channel_number"] != previous["channel_number"]:
+            return None
+        if self.current_playing_file_path != program["path"]:
+            return None
+        try:
+            start = float(self.mpv.time_pos or 0)
+        except Exception:
+            start = 0.0
+        return {**program, "start": start}
+
+    def _guide_nav_command(self, response):
+        payload = response.payload if response else None
+        if isinstance(payload, str) and payload.startswith("web_key:"):
+            return self.GUIDE_NAV_KEYS.get(payload.split(":", 1)[1])
+        return None
+
+    @staticmethod
+    def _poll_guide_tune(events):
+        """Returns the channel the guide asked to tune to, if any."""
+        if events is None:
+            return None
+        try:
+            message = events.get_nowait()
+        except Empty:
+            return None
+        if isinstance(message, dict) and message.get("event") == "tune":
+            return message.get("channel")
+        return None
+
+    def _close_guide(self, queue, guide_process):
+        self._l.info("Sending the guide channel shutdown command")
+        queue.put(GuideCommands.hide_window)
+        guide_process.join(timeout=2)
+        if guide_process.is_alive():
+            self._l.warning("Guide process did not exit after the close command; terminating it")
+            guide_process.terminate()
+            guide_process.join(timeout=1)
+        if guide_process.is_alive():
+            self._l.error("Guide process did not terminate; killing it")
+            guide_process.kill()
+            guide_process.join(timeout=1)
+        self._activate_mpv_after_guide = True
+
     def show_guide(self, guide_config):
-        # create the pipe to communicate with the guide channel
+        # capture what is playing before the guide takes over mpv for its music
+        preview = self._guide_preview_context()
+        # create the pipes to communicate with the guide channel (commands in, tune requests out)
         queue = multiprocessing.Queue()
+        events = multiprocessing.Queue()
         guide_process = multiprocessing.Process(
             target=guide_channel_runner,
             args=(
                 guide_config,
                 queue,
+                events,
+                preview,
             ),
         )
         guide_process.start()
+        previous_loop_playlist = self.mpv.loop_playlist
+        guide_audio_started = False
 
         if "play_sound" in guide_config and guide_config["play_sound"]:
             sound_to_play = guide_config["sound_to_play"]
@@ -862,12 +985,15 @@ class StationPlayer:
                 self.mpv.stop()
                 self.current_playing_file_path = None
             elif len(sound_to_play) == 1:
-                # Single file - use the simple play_file method
+                # Loop the guide track until the guide closes.
                 self._l.info(f"Playing guide audio from single file: {sound_to_play[0]}")
+                self.mpv.loop_playlist = "inf"
                 playing = self.play_file(sound_to_play[0])
                 if not playing:
                     self.mpv.stop()
                     self.current_playing_file_path = None
+                else:
+                    guide_audio_started = True
             else:
                 # Multiple files - use shuffle playlist
                 self._l.info(f"Playing guide audio as shuffle playlist with {len(sound_to_play)} files")
@@ -875,35 +1001,53 @@ class StationPlayer:
                 if not playing:
                     self.mpv.stop()
                     self.current_playing_file_path = None
+                else:
+                    guide_audio_started = True
         else:
             self.mpv.stop()
             self.current_playing_file_path = None
 
-        # update status
-        update_status_socket(
-            "playing",
-            self.station_config["network_name"],
-            self.station_config["channel_number"],
-            self.station_config["network_name"],
-            timestamp=StationManager().server_conf["date_time_format"],
-            content_type="guide",
-        )
-        keep_going = True
-        while keep_going:
-            time.sleep(0.05)
-            response = self.input_check_fn()
-            if response:
-                if self.handle_runtime_command_outcome(response):
-                    continue
-                if self.is_non_interrupting(response):
-                    self._l.debug(f"Ignoring non-interrupting command on guide channel: {response.payload}")
-                    continue
-                self._l.info("Sending the guide channel shutdown command")
-                queue.put(GuideCommands.hide_window)
-                guide_process.join()
-                return response
+        try:
+            update_status_socket(
+                "playing",
+                self.station_config["network_name"],
+                self.station_config["channel_number"],
+                self.station_config["network_name"],
+                timestamp=StationManager().server_conf["date_time_format"],
+                content_type="guide",
+            )
+            keep_going = True
+            while keep_going:
+                time.sleep(0.05)
 
-        return PlayerOutcome(PlayerState.SUCCESS)
+                tune_channel = self._poll_guide_tune(events)
+                if tune_channel is not None:
+                    self._close_guide(queue, guide_process)
+                    request = {"command": "direct", "channel": tune_channel}
+                    return PlayerOutcome(PlayerState.CHANNEL_CHANGE, json.dumps(request))
+
+                response = self.input_check_fn()
+                if response:
+                    if self.handle_runtime_command_outcome(response):
+                        continue
+                    nav_command = self._guide_nav_command(response)
+                    if nav_command:
+                        queue.put(nav_command)
+                        continue
+                    if self.is_non_interrupting(response):
+                        self._l.debug(f"Ignoring non-interrupting command on guide channel: {response.payload}")
+                        continue
+                    self._close_guide(queue, guide_process)
+                    return response
+
+            return PlayerOutcome(PlayerState.SUCCESS)
+        finally:
+            try:
+                if guide_audio_started:
+                    self.mpv.stop()
+                    self.current_playing_file_path = None
+            finally:
+                self.mpv.loop_playlist = previous_loop_playlist
 
 
     def stop_player(self):
@@ -1071,6 +1215,15 @@ class StationPlayer:
                     response = self._pending_response
                     self._pending_response = None
                     return response
+                if worked:
+                    self._show_pending_channel_banner(title)
+                    if not is_stream and media_type == 'video' and self.station_config:
+                        self._last_program = {
+                            "path": entry.path,
+                            "title": title,
+                            "channel_number": self.station_config["channel_number"],
+                            "network_name": self.station_config["network_name"],
+                        }
                 stream_is_down = False
                 last_osd_refresh = 0.0
                 if not worked:

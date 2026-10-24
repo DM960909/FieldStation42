@@ -13,7 +13,7 @@ FieldStation42 turns your Linux computer or Raspberry Pi into a broadcast and ca
 - **IR remote support** — use any IR remote with a Flirc USB receiver
 - **On-screen display** — channel banners and now-playing info overlay on the screen
 - **Extensive REST API** — control playback, change channels, query status, and build your own tools and integrations against a full HTTP API
-- **Runs anywhere** — Raspberry Pi, any Linux machine, or Windows via WSL
+- **Runs anywhere** — macOS, Raspberry Pi, Linux machines, or Windows via WSL
 
 ## Documentation
 
@@ -23,6 +23,28 @@ Full documentation, installation guide, and channel configuration walkthroughs a
 
 
 ## Quick Start
+
+### macOS
+
+```bash
+# Install dependencies with Homebrew
+brew install python mpv ffmpeg
+
+# Clone the repo
+git clone https://github.com/shane-mason/FieldStation42
+cd FieldStation42
+
+# Run the installer
+bash install.sh
+
+# Activate the environment
+source env/bin/activate
+
+# Start the web console
+python3 station_42.py
+```
+
+### Linux
 
 ```bash
 # Install dependencies
@@ -50,7 +72,7 @@ For the full step-by-step walkthrough, see the [Getting Started guide](https://f
 
 ## Requirements
 
-- Linux (Raspberry Pi OS Bookworm recommended, Ubuntu, Mint, Debian, or WSL on Windows)
+- macOS or Linux (Raspberry Pi OS Bookworm recommended, Ubuntu, Mint, Debian, or WSL on Windows)
 - Python 3.10 or newer
 - MPV
 

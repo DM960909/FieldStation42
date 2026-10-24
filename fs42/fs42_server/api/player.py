@@ -52,6 +52,23 @@ async def get_info():
 
 async def _get_cpu_temperature():
     """Get CPU temperature using various methods depending on the system"""
+    if platform.system() == "Darwin":
+        try:
+            # macOS exposes CPU temps through power-related tooling; this is not always available.
+            sensors = subprocess.check_output(["powermetrics", "--samplers", "cpu_power", "-n", "1"], stderr=subprocess.DEVNULL, text=True)
+            for line in sensors.splitlines():
+                if "CPU die temperature" in line or "CPU die temp" in line:
+                    match = re.search(r"(\d+(?:\.\d+)?)\s*°C", line)
+                    if match:
+                        temp_c = float(match.group(1))
+                        return {
+                            "temperature_c": round(temp_c, 1),
+                            "temperature_f": round((temp_c * 1.8) + 32),
+                            "temp_source": "powermetrics"
+                        }
+        except Exception:
+            pass
+        return {"temperature": "unavailable"}
     
     # Method 1: Raspberry Pi vcgencmd (original method)
     if shutil.which("vcgencmd"):
@@ -105,7 +122,36 @@ async def _get_cpu_temperature():
 
 
 async def _get_memory_info():
-    """Get memory information from /proc/meminfo"""
+    """Get memory information from platform-native OS APIs"""
+    platform_name = platform.system()
+
+    if platform_name == "Darwin":
+        try:
+            total_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+            vm_stat = subprocess.check_output(["vm_stat"], text=True)
+            page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True).strip())
+            pages_free = 0
+            pages_inactive = 0
+            for line in vm_stat.splitlines():
+                if line.startswith("Pages free:"):
+                    pages_free = int(line.split()[2].rstrip('.'))
+                elif line.startswith("Pages inactive:"):
+                    pages_inactive = int(line.split()[2].rstrip('.'))
+            available_bytes = (pages_free + pages_inactive) * page_size
+            used_bytes = total_bytes - available_bytes
+            used_percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 0
+
+            return {
+                "memory": {
+                    "total_gb": round(total_bytes / (1024**3), 1),
+                    "available_gb": round(available_bytes / (1024**3), 1),
+                    "used_gb": round(used_bytes / (1024**3), 1),
+                    "used_percent": used_percent,
+                }
+            }
+        except Exception:
+            return {"memory": {"error": "unavailable"}}
+
     try:
         with open("/proc/meminfo", "r") as f:
             meminfo = f.read()
@@ -142,6 +188,25 @@ async def _get_memory_info():
 
 async def _get_cpu_info():
     """Get CPU usage information"""
+    if platform.system() == "Darwin":
+        try:
+            cpu_count = int(subprocess.check_output(["sysctl", "-n", "hw.ncpu"], text=True).strip())
+            loadavg = subprocess.check_output(["uptime"], text=True)
+            match = re.search(r"load averages?:\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", loadavg)
+            if match:
+                return {
+                    "cpu": {
+                        "cores": cpu_count,
+                        "load_1min": float(match.group(1)),
+                        "load_5min": float(match.group(2)),
+                        "load_15min": float(match.group(3)),
+                        "load_percent": round((float(match.group(1)) / cpu_count) * 100, 1) if cpu_count > 0 else 0,
+                    }
+                }
+            return {"cpu": {"cores": cpu_count, "load": "unavailable"}}
+        except Exception:
+            return {"cpu": {"error": "unavailable"}}
+
     try:
         # Get CPU count
         cpu_count = 0
@@ -181,6 +246,7 @@ async def _get_cpu_info():
             }
     except Exception:
         return {"cpu": {"error": "unavailable"}}
+
 
 @router.get("/status")
 async def get_player_status():
@@ -315,44 +381,126 @@ async def volume_mute():
 
 
 async def _control_volume(action: str):
-    """Control volume using the most appropriate Linux audio system"""
-    
-    # Check what audio systems are available
+    """Control volume using the most appropriate native audio system"""
+    osascript_available = shutil.which("osascript") is not None
     amixer_available = shutil.which("amixer") is not None
     pactl_available = shutil.which("pactl") is not None
     wpctl_available = shutil.which("wpctl") is not None
     
-    # Try different audio systems in order of preference
-    # For WSL, prefer PulseAudio over ALSA since ALSA usually fails
-
     response = None
 
-    if pactl_available:
+    if platform.system() == "Darwin" and osascript_available:
+        try:
+            response = await _volume_osascript(action)
+        except Exception as e:
+            print(f"osascript failed: {e}")
+
+    if response is None and pactl_available:
         try:
             response = await _volume_pulseaudio(action)
         except Exception as e:
             print(f"pactl failed: {e}")
-            
-    if amixer_available and response is None:
+    
+    if response is None and amixer_available:
         try:
             response = await _volume_amixer(action)
         except Exception as e:
             print(f"amixer failed (expected in WSL): {e}")
-            
-    if wpctl_available and response is None:
+    
+    if response is None and wpctl_available:
         try:
             response = await _volume_wireplumber(action)
         except Exception as e:
             print(f"wpctl failed: {e}")
 
     if not response:
-        raise HTTPException(status_code=500, detail=f"No supported audio system found or all failed. Available: amixer={amixer_available}, pactl={pactl_available}, wpctl={wpctl_available}")
+        raise HTTPException(status_code=500, detail=f"No supported audio system found or all failed. Available: osascript={osascript_available}, amixer={amixer_available}, pactl={pactl_available}, wpctl={wpctl_available}")
 
     as_str = json.dumps(response)
     with open(VOLUME_SOCKET, "w") as fp:
         fp.write(as_str)
 
     return response
+
+
+async def _volume_osascript(action: str):
+    """Control volume on macOS using the native AppleScript audio API."""
+    try:
+        settings = subprocess.run(["osascript", "-e", "get volume settings"], capture_output=True, text=True, check=True)
+        stdout = settings.stdout.strip()
+        is_muted = "output muted:true" in stdout.lower()
+        current_volume_match = re.search(r"output volume:(\d+)", stdout)
+        current_vol = int(current_volume_match.group(1)) if current_volume_match else 0
+
+        if action == "up":
+            target = min(100, current_vol + VOLUME_STEP)
+            cmd = ["osascript", "-e", f"set volume output volume {target}"]
+            message = f"Volume increased by {VOLUME_STEP}%"
+        elif action == "down":
+            target = max(0, current_vol - VOLUME_STEP)
+            cmd = ["osascript", "-e", f"set volume output volume {target}"]
+            message = f"Volume decreased by {VOLUME_STEP}%"
+        elif action == "mute":
+            target_muted = not is_muted
+            cmd = ["osascript", "-e", f"set volume output muted {str(target_muted).lower()}"]
+            message = "Mute toggled"
+        else:
+            raise ValueError(f"Invalid action: {action}")
+
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        updated = subprocess.run(["osascript", "-e", "get volume settings"], capture_output=True, text=True, check=True)
+        updated_out = updated.stdout.strip()
+        updated_muted = "output muted:true" in updated_out.lower()
+        updated_match = re.search(r"output volume:(\d+)", updated_out)
+        updated_vol = updated_match.group(1) if updated_match else str(current_vol)
+        status = "MUTED" if updated_muted else f"{updated_vol}%"
+
+        return {"action": action, "method": "osascript", "status": "success", "message": message, "volume": status}
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"macOS osascript failed: {e.stderr}")
+
+
+async def _volume_pulseaudio(action: str):
+    """Control volume using PulseAudio pactl"""
+    try:
+        if action == "up":
+            # Check current volume before increasing
+            current_volume_str = await _get_pulseaudio_volume()
+            current_vol_match = re.search(r'(\d+)%', current_volume_str)
+            current_vol = int(current_vol_match.group(1)) if current_vol_match else 0
+
+            # Cap at 100% (PulseAudio uses 65536 as 100%)
+            if current_vol >= 100:
+                return {"action": action, "method": "pulseaudio", "status": "capped", "message": "Volume already at maximum (100%)", "volume": "100%"}
+            elif current_vol > 100 - VOLUME_STEP:
+                # Set to exactly 100%
+                cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"]
+                message = "Volume set to maximum (100%)"
+            else:
+                cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"+{VOLUME_STEP}%"]
+                message = f"Volume increased by {VOLUME_STEP}%"
+        elif action == "down":
+            cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"-{VOLUME_STEP}%"]
+            message = f"Volume decreased by {VOLUME_STEP}%"
+        elif action == "mute":
+            cmd = ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"]
+            message = "Mute toggled"
+        else:
+            raise ValueError(f"Invalid action: {action}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+        # Get current volume and mute status after the change
+        if action == "mute":
+            volume_level = await _get_pulseaudio_mute_status()
+        else:
+            volume_level = await _get_pulseaudio_volume()
+
+        return {"action": action, "method": "pulseaudio", "status": "success", "message": message, "volume": volume_level}
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"PulseAudio pactl failed: {e.stderr}")
+
 
 async def _volume_amixer(action: str):
     """Control volume using ALSA amixer (most common on Raspberry Pi)"""
@@ -445,48 +593,6 @@ async def _volume_amixer(action: str):
             return {"action": action, "method": "amixer", "status": "success", "message": f"{message} (PCM)", "volume": volume_level}
         except subprocess.CalledProcessError as e:
             raise HTTPException(status_code=500, detail=f"ALSA amixer failed: {e.stderr}")
-
-
-async def _volume_pulseaudio(action: str):
-    """Control volume using PulseAudio pactl"""
-    try:
-        if action == "up":
-            # Check current volume before increasing
-            current_volume_str = await _get_pulseaudio_volume()
-            current_vol_match = re.search(r'(\d+)%', current_volume_str)
-            current_vol = int(current_vol_match.group(1)) if current_vol_match else 0
-
-            # Cap at 100% (PulseAudio uses 65536 as 100%)
-            if current_vol >= 100:
-                return {"action": action, "method": "pulseaudio", "status": "capped", "message": "Volume already at maximum (100%)", "volume": "100%"}
-            elif current_vol > 100 - VOLUME_STEP:
-                # Set to exactly 100%
-                cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"]
-                message = "Volume set to maximum (100%)"
-            else:
-                cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"+{VOLUME_STEP}%"]
-                message = f"Volume increased by {VOLUME_STEP}%"
-        elif action == "down":
-            cmd = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"-{VOLUME_STEP}%"]
-            message = f"Volume decreased by {VOLUME_STEP}%"
-        elif action == "mute":
-            cmd = ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"]
-            message = "Mute toggled"
-        else:
-            raise ValueError(f"Invalid action: {action}")
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-        # Get current volume and mute status after the change
-        if action == "mute":
-            volume_level = await _get_pulseaudio_mute_status()
-        else:
-            volume_level = await _get_pulseaudio_volume()
-
-        return {"action": action, "method": "pulseaudio", "status": "success", "message": message, "volume": volume_level}
-
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"PulseAudio pactl failed: {e.stderr}")
 
 
 async def _volume_wireplumber(action: str):

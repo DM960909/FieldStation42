@@ -287,13 +287,15 @@ class OsdWindow(QWidget):
         super().__init__()
         self.objects = objects
 
-        self.setWindowFlags(
+        window_flags = (
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
             | Qt.Tool
             | Qt.WindowDoesNotAcceptFocus
-            | Qt.X11BypassWindowManagerHint
         )
+        if hasattr(Qt, "X11BypassWindowManagerHint"):
+            window_flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(window_flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)

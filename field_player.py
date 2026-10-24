@@ -287,7 +287,9 @@ def main_loop(transition_fn, shutdown_queue=None, api_proc=None, schedule_lock=N
             with shelve.open(STATE_SHELVE) as s:
                 s["channel_index"] = channel_index
             channel_conf = station_cache[channel_index]
+            player.previous_station_config = player.station_config
             player.station_config = channel_conf
+            player._channel_banner_pending = True
 
             # long_change_effect(player, reception)
             transition_fn(player, reception)

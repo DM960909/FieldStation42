@@ -47,6 +47,22 @@ echo ""
 echo -e "${BLUE}Starting installation...${NC}"
 echo ""
 
+# Determine platform
+PLATFORM="unknown"
+case "$(uname -s)" in
+  Darwin)
+    PLATFORM="macos"
+    ;;
+  Linux)
+    PLATFORM="linux"
+    ;;
+  *)
+    PLATFORM="other"
+    ;;
+esac
+
+echo -e "${BLUE}Platform detected: ${CYAN}$PLATFORM${NC}"
+
 echo -e "${INFO} Finding python installation..."
 python=python3
 
@@ -62,7 +78,39 @@ else
     exit -1
 fi
 
+if [ "$PLATFORM" = "macos" ]; then
+  echo -e "${INFO} Detected macOS. Checking for Homebrew and required tools..."
+  if ! type "brew" > /dev/null; then
+    echo -e "${ERROR} Homebrew is required on macOS. Install it from https://brew.sh and rerun this installer."
+    exit 1
+  fi
+
+  if ! command -v mpv >/dev/null 2>&1; then
+    echo -e "${INFO} Installing MPV with Homebrew..."
+    brew install mpv
+  else
+    echo -e "${CHECK} mpv already installed"
+  fi
+
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo -e "${INFO} Installing FFmpeg with Homebrew..."
+    brew install ffmpeg
+  else
+    echo -e "${CHECK} ffmpeg already installed"
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${ERROR} Python 3 is not available on PATH. Install it with Homebrew and rerun the installer."
+    exit 1
+  fi
+fi
+
+if [ "$PLATFORM" = "linux" ] && [ ! -f /.dockerenv ]; then
+  echo -e "${INFO} On Linux, using a venv for Python packages."
+fi
+
 echo -e "${INFO} Moving forward with python :: ${GREEN}$python${NC}"
+
 echo -e "${INFO} Creating python virtual environment..."
 
 if [ -f /.dockerenv ]; then
@@ -183,9 +231,15 @@ echo -e "${INFO} You can find example configurations in ${CYAN}confs/examples${N
 echo -e "${INFO} Visit the wiki for details ${CYAN}https://github.com/shane-mason/FieldStation42/wiki${NC}"
 echo ""
 echo -e "${INFO} To set up FieldStation42 as auto-starting systemd services:"
-echo -e "       ${CYAN}bash install/install_services.sh${NC}"
-echo ""
+if [ "$PLATFORM" = "macos" ]; then
+  echo -e "       ${YELLOW}macOS does not use systemd. This step is skipped automatically.${NC}"
+else
+  echo -e "       ${CYAN}bash install/install_services.sh${NC}"
+fi
+
 echo -e "${WARN} NOTE: If you want to use web type channels on Raspberry Pi Bookworm,"
-echo -e "       you will also need to run:"
-echo -e "       ${YELLOW}sudo bash install/web_reqs.sh${NC}"
-echo ""
+if [ "$PLATFORM" = "macos" ]; then
+  echo -e "       ${YELLOW}On macOS, install the required native dependencies with Homebrew instead of apt-get.${NC}"
+else
+  echo -e "       ${YELLOW}sudo bash install/web_reqs.sh${NC}"
+fi
